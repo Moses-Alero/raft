@@ -63,7 +63,7 @@ type AppendEntriesArgs struct{
   leaderCommit int
 }
 
-type AppendEntriesReplyArgs{
+type AppendEntriesReplyArgs struct{
   term  int
   success bool
 }
@@ -121,7 +121,7 @@ func NewNode(id int, peerIds []int, server *Server, ready <-chan interface{}) *N
 //returns a true or false to the client if the node is a leader node or not,
 //note that this is not suffivent and a more intitutive ethod is needed to inform the client
 //that the node is nit the leader node.
-func (node *Nodemodel) Submit(command interface) bool{
+func (node *NodeModel) Submit(command interface{}) bool{
   node.mux.Lock()
   defer node.mux.Unlock()
 
@@ -130,7 +130,11 @@ func (node *Nodemodel) Submit(command interface) bool{
     return false
   }
   node.Logger("Command received from cient, command: %v", command)
-  node.log =  append(node.log, command)
+  logEntry := LogEntries{
+    command: command,
+    term:    node.currentTerm,
+  }
+  node.log =  append(node.log, logEntry)
   return true
   
 }
@@ -239,7 +243,7 @@ func (node *NodeModel) SendHeartBeats(){
     
   heartBeatArgs := AppendEntriesArgs{
     term:  termOnHeartBeatSend,
-    leaderId:  node.id
+    leaderId:  node.id,
   }
 
   var reply AppendEntriesReplyArgs
@@ -257,7 +261,7 @@ func (node *NodeModel) SendHeartBeats(){
 
         if reply.term > termOnHeartBeatSend{
           node.Logger("Seems my term is outdated, term has change from %d to %d", termOnHeartBeatSend, reply.term)
-          node.ChangeToFollower()
+          node.ChangeToFollower(reply.term)
           return
         }
       }
@@ -334,8 +338,8 @@ func (node *NodeModel) RequestVote(requestArgs RequestVoteArgs, reply *RequestVo
   }
   //check if the terms match
   if requestArgs.term == node.currentTerm && (node.votedFor == -1 || node.votedFor == requestArgs.candidateId){
-    reply.term == node.currentTerm 
-    reply.votedFor = requestArgs.candidateId
+    reply.term = node.currentTerm 
+    node.votedFor = requestArgs.candidateId
     reply.voteGranted = true
   } else{
     reply.voteGranted = false
@@ -355,8 +359,8 @@ func (node *NodeModel) AppendEntries(entriesArgs AppendEntriesArgs, reply *Appen
 
   node.Logger("AppendEntries to node from Leader: %v", entriesArgs)
 
-  if entriesArgs.term > nopde.currentTerm{
-      node.Logger("My term is outdated needs to updated to new term %d", entries.term)
+  if entriesArgs.term > node.currentTerm{
+      node.Logger("My term is outdated needs to updated to new term %d", entriesArgs.term)
       node.ChangeToFollower(entriesArgs.term)
   }
 
