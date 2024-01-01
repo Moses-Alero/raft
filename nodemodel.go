@@ -36,15 +36,18 @@ const (
 )
 
 
-
 //This is the information a node sends to it's peers
 //when it is campaigining for votes
 
 type RequestVoteArgs struct{
   term         int
   candidateId  int
-  lastLogUndex int 
+  lastLogIndex int
+  prevLogIndex int 
+  prevLogTerm int
+  entries  []LogEntries
   lastLogTerm  int  
+  leaderCommit int
 }
 
 //Response from nodes in the cluster after they have been lobbied for votes
@@ -59,7 +62,6 @@ type AppendEntriesArgs struct{
   prevLogIndex int
   prevLogTerm  int
   entries      []LogEntries
-
   leaderCommit int
 }
 
@@ -73,7 +75,7 @@ type AppendEntriesReplyArgs struct{
 type NodeModel struct{
   mux         sync.Mutex 
   id          int
-  //volatile state info
+  
   state       NodeState
   timeToNextElection time.Time
 
@@ -82,9 +84,18 @@ type NodeModel struct{
   votedFor    int
   log         []LogEntries
 
-  //volatile state
+  //volatile state on all servers
   commitIndex int
   lastApplied int
+
+  //volatile state on Leaders
+  nextIndex   map[int]int
+  matchIndex  map[int]int
+  
+  commitChan  chan <- CommitEntries
+
+  newCommitReadyChan  chan struct{}
+
 
   peerIds     []int
   server      *Server    //RPC server for communnicating with the other node is in the cluster
@@ -240,17 +251,32 @@ func (node *NodeModel) SendHeartBeats(){
   node.mux.Lock()
   termOnHeartBeatSend := node.currentTerm
   node.mux.Unlock()
-    
-  heartBeatArgs := AppendEntriesArgs{
-    term:  termOnHeartBeatSend,
-    leaderId:  node.id,
-  }
+   
 
   var reply AppendEntriesReplyArgs
   for _, peerId := range node.peerIds{
       
     go func(peerId int){
       
+			nextIndex := node.nextIndex[peerId]
+			prevLogIndex := nextIndex - 1
+      prevLogTerm := -1
+
+    if prevLogIndex >= 0 {
+      prevLogTerm = node.log[prevLogIndex].term
+    }
+
+    entries := node.log[nextIndex:]
+
+     heartBeatArgs := AppendEntriesArgs{
+      term:  termOnHeartBeatSend,
+      leaderId:  node.id,
+      prevLogTerm: prevLogTerm,
+      prevLogIndex: prevLogIndex,
+      entries: entries,
+      leaderCommit: node.commitIndex,
+     }
+
       node.Logger("Sending Heartbeats to peer{%d}, with args=%v", termOnHeartBeatSend, heartBeatArgs)
       err := node.server.Call(peerId, "NodeModel.AppendEntries", heartBeatArgs, &reply)
       if err == nil{
@@ -260,12 +286,42 @@ func (node *NodeModel) SendHeartBeats(){
         node.Logger("Reply received from peer{%d}, with args %v", peerId, reply)
 
         if reply.term > termOnHeartBeatSend{
-          node.Logger("Seems my term is outdated, term has change from %d to %d", termOnHeartBeatSend, reply.term)
+          node.Logger("Seems my term is outdated, term has changed from %d to %d", termOnHeartBeatSend, reply.term)
           node.ChangeToFollower(reply.term)
           return
         }
-      }
-      
+
+        if node.state == Leader && termOnHeartBeatSend == reply.term{
+          if reply.success{
+            node.nextIndex[peerId] = nextIndex + len(entries)
+            node.matchIndex[peerId] = node.nextIndex[peerId] - 1
+            node.Logger("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerId, node.nextIndex, node.matchIndex)
+            
+            savedCommitIndex := node.commitIndex
+            for i := node.commitIndex + 1; i < len(node.log); i++ {
+              if node.log[i].term == node.currentTerm {
+                matchCount := 1
+                for _, peerId := range node.peerIds {
+                  if node.matchIndex[peerId] >= i {
+                    matchCount++
+                  }
+                }
+                if matchCount*2 > len(node.peerIds)+1 {
+                  node.commitIndex = i
+                }
+              }
+            }
+
+            if node.commitIndex != savedCommitIndex {
+              node.Logger("leader sets commitIndex := %d", node.commitIndex)
+              node.newCommitReadyChan <- struct{}{}
+            }
+					} else {
+            node.nextIndex[peerId] = nextIndex - 1
+            node.Logger("AppendEntries reply from %d !success: nextIndex := %d", peerId, nextIndex-1)
+           }
+          }
+        }     
     }(peerId) 
   }
 }
@@ -377,3 +433,32 @@ func (node *NodeModel) AppendEntries(entriesArgs AppendEntriesArgs, reply *Appen
   node.Logger("reply sent back to Leader: %v", *reply)
   return nil
 }
+
+func (node *NodeModel) SendToCommitChan(){
+	
+	for range node.newCommitReadyChan{
+		
+		node.mux.Lock()
+		var entries []LogEntries
+		savedTerm := node.currentTerm
+		savedLastApplied := node.lastApplied
+
+		if node.commitIndex > savedLastApplied {
+			entries = node.log[node.lastApplied + 1 : node.commitIndex + 1]
+			node.lastApplied = node.commitIndex
+		}
+		node.mux.Unlock()
+
+		node.Logger("Send to entries: %v, to commit channel with lastApplied index:%d", entries, node.lastApplied)
+
+		for i, entry := range entries{
+			node.commitChan <- CommitEntries{
+				command: entry.command,
+				entryIndex:  savedLastApplied + i + 1,
+				term: savedTerm,
+			}
+		}
+	}
+	node.Logger("Commit sent to channel")
+}
+
